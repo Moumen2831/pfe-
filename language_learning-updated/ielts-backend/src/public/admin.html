@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IELTS Admin — Add Text</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #f5f4f0;
+      --surface:  #ffffff;
+      --surface2: #f0efe9;
+      --border:   #e0ddd6;
+      --border2:  #c8c5bc;
+      --text:     #1a1916;
+      --muted:    #6b6860;
+      --hint:     #9b9890;
+      --blue:     #185FA5;
+      --blue-d:   #0C447C;
+      --blue-bg:  #E6F1FB;
+      --blue-t:   #378ADD;
+      --green:    #3B6D11;
+      --green-bg: #EAF3DE;
+      --red:      #A32D2D;
+      --red-bg:   #FCEBEB;
+      --radius:   10px;
+      --radius-sm:6px;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 0;
+    }
+
+    /* ── top bar ── */
+    .topbar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .topbar-logo { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
+    .topbar-logo span { color: var(--blue); }
+    .topbar-sep { color: var(--border2); font-size: 18px; }
+    .topbar-page { font-size: 14px; color: var(--muted); }
+    .topbar-status {
+      margin-left: auto;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      background: var(--surface2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border2); }
+    .status-dot.online { background: #639922; }
+
+    /* ── layout ── */
+    .layout {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 1.5rem;
+      align-items: start;
+    }
+
+    /* ── cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 1.25rem;
+    }
+
+    /* ── fields ── */
+    .field { margin-bottom: 1.1rem; }
+    .field:last-child { margin-bottom: 0; }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+    /* optional badge on label */
+    label .opt {
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--hint);
+      margin-left: 5px;
+    }
+    input[type="text"],
+    input[type="url"],
+    textarea,
+    select {
+      width: 100%;
+      font-family: inherit;
+      font-size: 14px;
+      color: var(--text);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      outline: none;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    input:focus, textarea:focus, select:focus {
+      border-color: var(--blue-t);
+      background: var(--surface);
+    }
+    textarea { resize: vertical; min-height: 150px; line-height: 1.65; }
+    .hint { font-size: 12px; color: var(--hint); margin-top: 5px; }
+    .char-count { font-size: 12px; color: var(--hint); text-align: right; margin-top: 4px; }
+
+    /* ── audio URL field inline indicator ── */
+    .audio-indicator {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--blue);
+      margin-top: 6px;
+      padding: 5px 9px;
+      background: var(--blue-bg);
+      border-radius: 5px;
+      border: 1px solid #BDD8F5;
+    }
+    .audio-indicator.show { display: flex; }
+    .audio-indicator svg { flex-shrink: 0; }
+
+    /* ── section pills ── */
+    .pills { display: flex; gap: 7px; flex-wrap: wrap; }
+    .pill {
+      padding: 6px 15px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+      background: var(--surface2);
+      color: var(--muted);
+      user-select: none;
+    }
+    .pill:hover { border-color: var(--border2); color: var(--text); }
+    .pill.active {
+      background: var(--blue-bg);
+      color: var(--blue);
+      border-color: var(--blue-t);
+    }
+
+    /* ── action buttons ── */
+    .actions { display: flex; gap: 8px; margin-top: 1.25rem; }
+    .btn {
+      flex: 1;
+      padding: 10px 18px;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      transition: all 0.15s;
+    }
+    .btn:hover { background: var(--surface2); }
+    .btn.primary {
+      background: var(--blue);
+      color: white;
+      border-color: var(--blue);
+    }
+    .btn.primary:hover { background: var(--blue-d); border-color: var(--blue-d); }
+    .btn.primary:active { transform: scale(0.98); }
+    .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    /* ── status banner ── */
+    .banner {
+      display: none;
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      margin-top: 1rem;
+      line-height: 1.5;
+    }
+    .banner.success { display: block; background: var(--green-bg); color: var(--green); border: 1px solid #C0DD97; }
+    .banner.error   { display: block; background: var(--red-bg);   color: var(--red);   border: 1px solid #F7C1C1; }
+
+    /* ── right panel ── */
+    .panel-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    /* ── JSON preview ── */
+    .json-box {
+      background: #1a1916;
+      color: #c8c5bc;
+      border-radius: var(--radius-sm);
+      padding: 1rem;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      overflow-x: auto;
+      white-space: pre;
+      min-height: 80px;
+    }
+    .json-key  { color: #9ECBFF; }
+    .json-str  { color: #9BE89B; }
+    .json-num  { color: #F8C555; }
+    .json-bool { color: #F8A757; }
+    .json-null { color: #8a8784; }
+    .json-punct { color: #6b6860; }
+
+    /* ── recent texts list ── */
+    .text-list { list-style: none; }
+    .text-item {
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .text-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .text-item-title { font-size: 13px; font-weight: 500; margin-bottom: 5px; }
+    .text-item-meta  { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+    .text-item-audio { font-size: 11px; color: var(--blue); margin-top: 3px; display: flex; align-items: center; gap: 4px; }
+    .badge {
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--surface2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .badge.done { background: var(--green-bg); color: var(--green); }
+    .empty-state { color: var(--hint); font-size: 13px; text-align: center; padding: 1.5rem 0; }
+
+    /* responsive */
+    @media (max-width: 680px) {
+      .layout { grid-template-columns: 1fr; }
+      .topbar { padding: 0 1rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-logo">IELTS <span>Admin</span></div>
+  <div class="topbar-sep">/</div>
+  <div class="topbar-page">Add source text</div>
+  <div class="topbar-status">
+    <div class="status-dot" id="dot"></div>
+    <span id="server-status">Checking...</span>
+  </div>
+</div>
+
+<div class="layout">
+
+  <!-- ── LEFT: FORM ── -->
+  <div>
+    <div class="card">
+      <div class="card-title">Text details</div>
+
+      <div class="field">
+        <label>Title</label>
+        <input type="text" id="title" placeholder="e.g. Speaking Part 1: Hometown description" oninput="updatePreview()">
+      </div>
+
+      <div class="field">
+        <label>Section</label>
+        <div class="pills">
+          <div class="pill" data-val="Listening" onclick="selectSection(this)">Listening</div>
+          <div class="pill" data-val="Reading"   onclick="selectSection(this)">Reading</div>
+          <div class="pill" data-val="Writing"   onclick="selectSection(this)">Writing</div>
+          <div class="pill active" data-val="Speaking" onclick="selectSection(this)">Speaking</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Content</label>
+        <textarea id="content" placeholder="Paste your source text here..." oninput="updatePreview(); updateCount()"></textarea>
+        <div class="char-count" id="char-count">0 characters</div>
+      </div>
+
+      <!-- ── Audio URL — always visible, stored directly in source_texts ── -->
+      <div class="field">
+        <label>
+          Audio URL
+          <span class="opt">optional</span>
+        </label>
+        <input
+          type="url"
+          id="audioUrl"
+          placeholder="https://yourcdn.com/audio.mp3"
+          oninput="updatePreview(); updateAudioIndicator()"
+        >
+        <p class="hint">
+          Stored in <code>source_texts.audio_url</code> and automatically copied to every generated question.
+          Leave blank if this section has no audio.
+        </p>
+        <!-- inline confirmation when a URL is entered -->
+        <div class="audio-indicator" id="audio-indicator">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+          </svg>
+          Audio URL will be saved with this text
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn" onclick="clearForm()">Clear</button>
+      <button class="btn primary" id="submit-btn" onclick="submitForm()">Submit text</button>
+    </div>
+
+    <div class="banner" id="banner"></div>
+  </div>
+
+  <!-- ── RIGHT: PREVIEW + RECENT ── -->
+  <div>
+    <div class="card">
+      <div class="panel-title">JSON preview</div>
+      <div class="json-box" id="preview"></div>
+    </div>
+
+    <div class="card">
+      <div class="panel-title">Recent texts</div>
+      <ul class="text-list" id="text-list">
+        <li class="empty-state">Loading...</li>
+      </ul>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  let selectedSection = 'Speaking';
+
+  // ── Syntax-highlight JSON ──────────────────────────────────────────────────
+  function highlight(obj) {
+    const json = JSON.stringify(obj, null, 2);
+    return json
+      .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*")\s*:/g,
+        m => `<span class="json-key">${m}</span>`)
+      .replace(/:\s*("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*")/g,
+        (_, q) => `: <span class="json-str">${q}</span>`)
+      .replace(/[{}\[\],]/g, m => `<span class="json-punct">${m}</span>`);
+  }
+
+  function updatePreview() {
+    const title    = document.getElementById('title').value;
+    const content  = document.getElementById('content').value;
+    const audioUrl = document.getElementById('audioUrl').value.trim();
+
+    // Shows exactly what will be POSTed to /api/texts
+    const obj = { title, content, section: selectedSection };
+    if (audioUrl) obj.audioUrl = audioUrl;
+
+    document.getElementById('preview').innerHTML = highlight(obj);
+  }
+
+  function updateCount() {
+    const len = document.getElementById('content').value.length;
+    document.getElementById('char-count').textContent = len.toLocaleString() + ' characters';
+  }
+
+  function updateAudioIndicator() {
+    const url = document.getElementById('audioUrl').value.trim();
+    document.getElementById('audio-indicator').classList.toggle('show', url.length > 0);
+  }
+
+  function selectSection(el) {
+    document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+    el.classList.add('active');
+    selectedSection = el.dataset.val;
+    updatePreview();
+  }
+
+  function clearForm() {
+    document.getElementById('title').value    = '';
+    document.getElementById('content').value  = '';
+    document.getElementById('audioUrl').value = '';
+    document.getElementById('char-count').textContent = '0 characters';
+    document.getElementById('banner').className = 'banner';
+    document.getElementById('audio-indicator').classList.remove('show');
+    updatePreview();
+  }
+
+  // ── Submit ─────────────────────────────────────────────────────────────────
+  async function submitForm() {
+    const title    = document.getElementById('title').value.trim();
+    const content  = document.getElementById('content').value.trim();
+    const audioUrl = document.getElementById('audioUrl').value.trim();
+    const banner   = document.getElementById('banner');
+    const btn      = document.getElementById('submit-btn');
+
+    if (!title || !content) {
+      banner.className = 'banner error';
+      banner.textContent = 'Title and content are required.';
+      return;
+    }
+
+    // Build payload — audioUrl is always included when present
+    const payload = { title, content, section: selectedSection };
+    if (audioUrl) payload.audioUrl = audioUrl;
+
+    btn.disabled = true;
+    btn.textContent = 'Submitting...';
+    banner.className = 'banner';
+
+    try {
+      const res  = await fetch('/api/texts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        banner.className = 'banner success';
+        banner.textContent = '✓ Text saved! Questions are being generated in the background.'
+          + (audioUrl ? ' Audio URL stored in source_texts.' : '');
+        clearForm();
+        loadRecentTexts();
+      } else {
+        banner.className = 'banner error';
+        banner.textContent = 'Error: ' + (data.error || 'Unknown error');
+      }
+    } catch {
+      banner.className = 'banner error';
+      banner.textContent = 'Could not reach the server. Make sure the backend is running.';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Submit text';
+    }
+  }
+
+  // ── Recent texts ───────────────────────────────────────────────────────────
+  async function loadRecentTexts() {
+    try {
+      const res  = await fetch('/api/texts');
+      const data = await res.json();
+      const list = document.getElementById('text-list');
+
+      if (!data.length) {
+        list.innerHTML = '<li class="empty-state">No texts yet</li>';
+        return;
+      }
+
+      list.innerHTML = data.slice(0, 8).map(t => `
+        <li class="text-item">
+          <div class="text-item-title">${escHtml(t.title)}</div>
+          <div class="text-item-meta">
+            <span class="badge ${t.processed ? 'done' : ''}">${t.section}</span>
+            <span>${t.question_count ?? 0} questions</span>
+            <span>${t.processed ? 'done' : 'pending'}</span>
+          </div>
+          ${t.audio_url ? `
+          <div class="text-item-audio">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+            ${escHtml(t.audio_url)}
+          </div>` : ''}
+        </li>
+      `).join('');
+    } catch {
+      document.getElementById('text-list').innerHTML =
+        '<li class="empty-state">Could not load texts</li>';
+    }
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Health check ───────────────────────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const res  = await fetch('/api/health');
+      const data = await res.json();
+      const dot  = document.getElementById('dot');
+      const txt  = document.getElementById('server-status');
+      if (data.status === 'ok') {
+        dot.classList.add('online');
+        txt.textContent = 'Server online';
+      } else {
+        txt.textContent = 'DB error';
+      }
+    } catch {
+      document.getElementById('server-status').textContent = 'Offline';
+    }
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  updatePreview();
+  checkHealth();
+  loadRecentTexts();
+  setInterval(loadRecentTexts, 10000);
+  setInterval(checkHealth, 15000);
+</script>
+</body>
+</html>

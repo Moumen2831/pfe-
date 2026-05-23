@@ -2,15 +2,29 @@ import { useState, useMemo } from "react";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
 import { Link } from "wouter";
-import { BookOpen, Filter, ChevronRight } from "lucide-react";
+import { BookOpen, Filter, ChevronRight, Wand2 } from "lucide-react";
+import { toast } from "sonner";
 
 type DifficultyLevel = "Beginner" | "Intermediate" | "Advanced";
+type CefrLevel = "A1" | "A2" | "B1" | "B2" | "C1" | "C2";
+type LessonSkill = "vocabulary" | "grammar" | "dialogue" | "listening" | "speaking" | "mixed";
 
 export default function LessonsPage() {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedDifficulty, setSelectedDifficulty] = useState<DifficultyLevel | null>(null);
+  const [topic, setTopic] = useState("restaurant");
+  const [cefrLevel, setCefrLevel] = useState<CefrLevel>("A2");
+  const [skillFocus, setSkillFocus] = useState<LessonSkill>("mixed");
 
+  const utils = trpc.useUtils();
   const { data: allLessons, isLoading } = trpc.lessons.all.useQuery();
+  const generateLesson = trpc.lessons.generate.useMutation({
+    onSuccess: async () => {
+      await utils.lessons.all.invalidate();
+      toast.success("Dynamic lesson generated and saved as a draft.");
+    },
+    onError: (error) => toast.error(error.message),
+  });
 
   const categories = useMemo(() => {
     if (!allLessons) return [];
@@ -48,6 +62,48 @@ export default function LessonsPage() {
           <p className="text-lg text-muted-foreground">
             Choose from our carefully curated lessons organized by category and difficulty level.
           </p>
+        </div>
+
+        <div className="mb-8 rounded-lg border border-border bg-card p-6 animate-slideUp">
+          <div className="mb-4 flex items-center gap-2">
+            <Wand2 className="h-5 w-5" />
+            <h2 className="text-lg font-semibold">Generate a Dynamic Lesson</h2>
+          </div>
+          <div className="grid gap-4 md:grid-cols-[1fr_120px_160px_auto]">
+            <input
+              value={topic}
+              onChange={(event) => setTopic(event.target.value)}
+              className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+              placeholder="Topic, for example restaurant"
+            />
+            <select
+              value={cefrLevel}
+              onChange={(event) => setCefrLevel(event.target.value as CefrLevel)}
+              className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              {["A1", "A2", "B1", "B2", "C1", "C2"].map(level => <option key={level} value={level}>{level}</option>)}
+            </select>
+            <select
+              value={skillFocus}
+              onChange={(event) => setSkillFocus(event.target.value as LessonSkill)}
+              className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              {["mixed", "vocabulary", "grammar", "dialogue", "listening", "speaking"].map(skill => <option key={skill} value={skill}>{skill}</option>)}
+            </select>
+            <Button
+              onClick={() => generateLesson.mutate({
+                topic,
+                cefrLevel,
+                skillFocus,
+                estimatedDurationMinutes: 25,
+              })}
+              disabled={generateLesson.isPending || topic.trim().length < 2}
+              className="gap-2"
+            >
+              <Wand2 className="h-4 w-4" />
+              {generateLesson.isPending ? "Generating" : "Generate"}
+            </Button>
+          </div>
         </div>
 
         {/* Filters */}
@@ -140,6 +196,11 @@ export default function LessonsPage() {
                       {lesson.title}
                     </h3>
                     <p className="text-sm text-muted-foreground mt-1">{lesson.category}</p>
+                    {lesson.cefrLevel && (
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {lesson.cefrLevel} · {lesson.skillFocus ?? "mixed"}
+                      </p>
+                    )}
                   </div>
                   <ChevronRight className="w-5 h-5 text-muted-foreground group-hover:text-primary transition-colors" />
                 </div>

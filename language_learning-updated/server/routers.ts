@@ -3,6 +3,8 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import * as db from "./db";
+import { generateLessonInputSchema } from "./modules/lessons/lesson.schema";
+import { generateValidatedLesson } from "./modules/lessons/lesson.service";
 
 export const appRouter = router({
   system: systemRouter,
@@ -24,6 +26,18 @@ export const appRouter = router({
     byCategory:   publicProcedure.input(z.object({ category: z.string() })).query(({ input }) => db.getLessonsByCategory(input.category)),
     byDifficulty: publicProcedure.input(z.object({ difficulty: z.enum(["Beginner", "Intermediate", "Advanced"]) })).query(({ input }) => db.getLessonsByDifficulty(input.difficulty)),
     byId:         publicProcedure.input(z.object({ id: z.number() })).query(({ input }) => db.getLessonById(input.id)),
+    generate:     publicProcedure.input(generateLessonInputSchema).mutation(async ({ input }) => {
+      const generated = await generateValidatedLesson(input);
+      const lesson = await db.createDynamicLesson({
+        lesson: generated.lesson,
+        generationPrompt: generated.prompt,
+      });
+      return { success: true, lesson };
+    }),
+    publish:      protectedProcedure.input(z.object({ id: z.number() })).mutation(async ({ input }) => {
+      const lesson = await db.publishLesson(input.id);
+      return { success: true, lesson };
+    }),
   }),
 
   quiz: router({
@@ -47,10 +61,49 @@ export const appRouter = router({
     getCompletedLessons: protectedProcedure.query(({ ctx }) => db.getUserCompletedLessons(ctx.user.id)),
     getProgress:         protectedProcedure.input(z.object({ lessonId: z.number() })).query(({ ctx, input }) => db.getUserProgress(ctx.user.id, input.lessonId)),
     getQuizAttempts:     protectedProcedure.query(({ ctx }) => db.getAllUserQuizAttempts(ctx.user.id)),
+    updateLesson:        protectedProcedure.input(z.object({
+      lessonId: z.number(),
+      status: z.enum(["not_started", "in_progress", "completed"]).optional(),
+      completionPercentage: z.number().min(0).max(100).optional(),
+      score: z.number().min(0).max(100).optional(),
+      vocabularyScore: z.number().min(0).max(100).optional(),
+      grammarScore: z.number().min(0).max(100).optional(),
+      listeningScore: z.number().min(0).max(100).optional(),
+      speakingScore: z.number().min(0).max(100).optional(),
+      quizScore: z.number().min(0).max(100).optional(),
+    })).mutation(({ ctx, input }) => db.updateLessonProgress(ctx.user.id, input.lessonId, input)),
+    recordAttempt:       protectedProcedure.input(z.object({
+      lessonId: z.number(),
+      blockId: z.string(),
+      blockType: z.string(),
+      userAnswer: z.unknown().optional(),
+      aiFeedback: z.unknown().optional(),
+      score: z.number().min(0).max(100).optional(),
+    })).mutation(({ ctx, input }) => db.recordLessonAttempt({ userId: ctx.user.id, ...input })),
     markComplete:        protectedProcedure.input(z.object({ lessonId: z.number() })).mutation(async ({ ctx, input }) => {
       await db.markLessonComplete(ctx.user.id, input.lessonId);
       return { success: true };
     }),
+  }),
+
+  recommendations: router({
+    getMine: protectedProcedure.query(({ ctx }) => db.getLessonRecommendations(ctx.user.id)),
+  }),
+
+  speaking: router({
+    recordAttempt: protectedProcedure.input(z.object({
+      lessonId: z.number(),
+      speakingTaskId: z.string(),
+      audioUrl: z.string().optional(),
+      transcript: z.string(),
+      targetText: z.string(),
+      pronunciationScore: z.number().min(0).max(100),
+      fluencyScore: z.number().min(0).max(100),
+      accuracyScore: z.number().min(0).max(100),
+      whisperResult: z.unknown().optional(),
+      speechbrainResult: z.unknown().optional(),
+      llamaFeedback: z.unknown().optional(),
+    })).mutation(({ ctx, input }) => db.recordSpeakingAttempt({ userId: ctx.user.id, ...input })),
   }),
 
   achievements: router({

@@ -8,7 +8,9 @@ import {
   boolean,
   numeric,
   index,
+  jsonb,
   serial,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
@@ -16,6 +18,10 @@ import { relations } from "drizzle-orm";
 export const roleEnum       = pgEnum("role",       ["user", "admin"]);
 export const difficultyEnum = pgEnum("difficulty", ["Beginner", "Intermediate", "Advanced"]);
 export const questionTypeEnum = pgEnum("question_type_app", ["multiple_choice", "fill_in_blank"]);
+export const cefrLevelEnum = pgEnum("cefr_level", ["A1", "A2", "B1", "B2", "C1", "C2"]);
+export const lessonSkillEnum = pgEnum("lesson_skill", ["vocabulary", "grammar", "dialogue", "listening", "speaking", "mixed"]);
+export const lessonStatusEnum = pgEnum("lesson_status", ["draft", "published", "archived", "failed_validation"]);
+export const lessonProgressStatusEnum = pgEnum("lesson_progress_status", ["not_started", "in_progress", "completed"]);
 
 // ── Users ────────────────────────────────────────────────────────────────────
 export const users = pgTable("users", {
@@ -44,11 +50,23 @@ export const lessons = pgTable("lessons", {
   content:     text("content").notNull(),
   examples:    text("examples"),
   order:       integer("order").default(0),
+  cefrLevel:   cefrLevelEnum("cefrLevel"),
+  skillFocus:  lessonSkillEnum("skillFocus"),
+  topic:       varchar("topic", { length: 100 }),
+  estimatedDurationMinutes: integer("estimatedDurationMinutes"),
+  lessonJson:  jsonb("lessonJson"),
+  generationPrompt: text("generationPrompt"),
+  generatedBy: varchar("generatedBy", { length: 100 }),
+  version:     integer("version").default(1).notNull(),
+  status:      lessonStatusEnum("status").default("draft").notNull(),
   createdAt:   timestamp("createdAt").defaultNow().notNull(),
   updatedAt:   timestamp("updatedAt").defaultNow().notNull(),
 }, (table) => ({
   categoryIdx:   index("category_idx").on(table.category),
   difficultyIdx: index("difficulty_idx").on(table.difficulty),
+  cefrIdx:       index("lesson_cefr_idx").on(table.cefrLevel),
+  skillIdx:      index("lesson_skill_idx").on(table.skillFocus),
+  statusIdx:     index("lesson_status_idx").on(table.status),
 }));
 
 export type Lesson       = typeof lessons.$inferSelect;
@@ -78,14 +96,80 @@ export const userProgress = pgTable("user_progress", {
   userId:      integer("userId").notNull(),
   lessonId:    integer("lessonId").notNull(),
   completed:   boolean("completed").default(false).notNull(),
+  status:      lessonProgressStatusEnum("status").default("not_started").notNull(),
+  completionPercentage: numeric("completionPercentage", { precision: 5, scale: 2 }).default("0").notNull(),
+  score:       numeric("score", { precision: 5, scale: 2 }).default("0").notNull(),
+  vocabularyScore: numeric("vocabularyScore", { precision: 5, scale: 2 }),
+  grammarScore:    numeric("grammarScore", { precision: 5, scale: 2 }),
+  listeningScore:  numeric("listeningScore", { precision: 5, scale: 2 }),
+  speakingScore:   numeric("speakingScore", { precision: 5, scale: 2 }),
+  quizScore:       numeric("quizScore", { precision: 5, scale: 2 }),
+  startedAt:   timestamp("startedAt"),
   completedAt: timestamp("completedAt"),
   createdAt:   timestamp("createdAt").defaultNow().notNull(),
+  updatedAt:   timestamp("updatedAt").defaultNow().notNull(),
 }, (table) => ({
   userLessonIdx: index("user_lesson_idx").on(table.userId, table.lessonId),
+  userLessonUniqueIdx: uniqueIndex("user_lesson_unique_idx").on(table.userId, table.lessonId),
 }));
 
 export type UserProgress       = typeof userProgress.$inferSelect;
 export type InsertUserProgress = typeof userProgress.$inferInsert;
+
+export const lessonAttempts = pgTable("lesson_attempts", {
+  id:        serial("id").primaryKey(),
+  userId:    integer("userId").notNull(),
+  lessonId:  integer("lessonId").notNull(),
+  blockId:   varchar("blockId", { length: 100 }).notNull(),
+  blockType: varchar("blockType", { length: 50 }).notNull(),
+  userAnswer: jsonb("userAnswer"),
+  aiFeedback: jsonb("aiFeedback"),
+  score:     numeric("score", { precision: 5, scale: 2 }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => ({
+  userLessonBlockIdx: index("lesson_attempt_user_lesson_block_idx").on(table.userId, table.lessonId, table.blockId),
+}));
+
+export type LessonAttempt = typeof lessonAttempts.$inferSelect;
+export type InsertLessonAttempt = typeof lessonAttempts.$inferInsert;
+
+export const speakingAttempts = pgTable("speaking_attempts", {
+  id:        serial("id").primaryKey(),
+  userId:    integer("userId").notNull(),
+  lessonId:  integer("lessonId").notNull(),
+  speakingTaskId: varchar("speakingTaskId", { length: 100 }).notNull(),
+  audioUrl: text("audioUrl"),
+  transcript: text("transcript"),
+  targetText: text("targetText").notNull(),
+  pronunciationScore: numeric("pronunciationScore", { precision: 5, scale: 2 }),
+  fluencyScore: numeric("fluencyScore", { precision: 5, scale: 2 }),
+  accuracyScore: numeric("accuracyScore", { precision: 5, scale: 2 }),
+  whisperResult: jsonb("whisperResult"),
+  speechbrainResult: jsonb("speechbrainResult"),
+  llamaFeedback: jsonb("llamaFeedback"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => ({
+  speakingUserLessonIdx: index("speaking_attempt_user_lesson_idx").on(table.userId, table.lessonId),
+}));
+
+export type SpeakingAttempt = typeof speakingAttempts.$inferSelect;
+export type InsertSpeakingAttempt = typeof speakingAttempts.$inferInsert;
+
+export const recommendations = pgTable("recommendations", {
+  id:        serial("id").primaryKey(),
+  userId:    integer("userId").notNull(),
+  lessonId:  integer("lessonId").notNull(),
+  reason:    text("reason").notNull(),
+  priority:  integer("priority").default(1).notNull(),
+  recommendationType: varchar("recommendationType", { length: 50 }).notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => ({
+  recommendationUserIdx: index("recommendation_user_idx").on(table.userId),
+  recommendationPriorityIdx: index("recommendation_priority_idx").on(table.userId, table.priority),
+}));
+
+export type Recommendation = typeof recommendations.$inferSelect;
+export type InsertRecommendation = typeof recommendations.$inferInsert;
 
 // ── Quiz Attempts ────────────────────────────────────────────────────────────
 export const quizAttempts = pgTable("quiz_attempts", {

@@ -5,6 +5,9 @@ import { Button } from "@/components/ui/button";
 import { useAuth } from "@/_core/hooks/useAuth";
 import { ArrowLeft, BookOpen, Play, CheckCircle } from "lucide-react";
 import { Streamdown } from "streamdown";
+import { LessonRenderer } from "@/components/lessons/LessonRenderer";
+import type { DynamicLesson, LessonBlock } from "@/types/lesson.types";
+import { toast } from "sonner";
 
 export default function LessonDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -19,9 +22,14 @@ export default function LessonDetailPage() {
     { lessonId },
     { enabled: isAuthenticated }
   );
+  const updateProgress = trpc.progress.updateLesson.useMutation({
+    onSuccess: () => toast.success("Progress saved."),
+    onError: (error) => toast.error(error.message),
+  });
 
   const examples = lesson?.examples ? JSON.parse(lesson.examples) : [];
   const currentCard = examples[currentCardIndex];
+  const dynamicLesson = normalizeDynamicLesson(lesson);
 
   if (isLoading) {
     return (
@@ -62,6 +70,31 @@ export default function LessonDetailPage() {
     }
   };
 
+  function handleBlockComplete(block: LessonBlock, result?: unknown) {
+    if (!isAuthenticated) {
+      toast.info("Sign in to save your lesson progress.");
+      return;
+    }
+
+    const totalBlocks = dynamicLesson?.blocks.length ?? 1;
+    const blockIndex = dynamicLesson?.blocks.findIndex(item => item.id === block.id) ?? 0;
+    const completionPercentage = Math.min(100, Math.round(((blockIndex + 1) / totalBlocks) * 100));
+    const score = typeof result === "object" && result && "score" in result
+      ? Number((result as { score?: number }).score)
+      : undefined;
+
+    updateProgress.mutate({
+      lessonId,
+      status: completionPercentage >= 100 ? "completed" : "in_progress",
+      completionPercentage,
+      ...(block.type === "vocabulary" ? { vocabularyScore: score ?? 100 } : {}),
+      ...(block.type === "grammar" ? { grammarScore: score ?? 100 } : {}),
+      ...(block.type === "listening" ? { listeningScore: score ?? 0 } : {}),
+      ...(block.type === "speaking" ? { speakingScore: score ?? 0 } : {}),
+      ...(block.type === "quiz" ? { quizScore: score ?? 0, score: score ?? 0 } : {}),
+    });
+  }
+
   return (
     <div className="min-h-screen py-12">
       <div className="container mx-auto px-4">
@@ -75,10 +108,10 @@ export default function LessonDetailPage() {
           </Button>
 
           <div className="flex items-start justify-between mb-6">
-            <div>
-              <h1 className="text-4xl font-bold mb-2">{lesson.title}</h1>
-              <p className="text-lg text-muted-foreground">{lesson.description}</p>
-            </div>
+          <div>
+            <h1 className="text-4xl font-bold mb-2">{lesson.title}</h1>
+            <p className="text-lg text-muted-foreground">{lesson.description}</p>
+          </div>
             <div className="flex flex-col items-end gap-2">
               <span className={`px-4 py-2 rounded-full text-sm font-medium ${getDifficultyColor(lesson.difficulty)}`}>
                 {lesson.difficulty}
@@ -94,19 +127,27 @@ export default function LessonDetailPage() {
 
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
             <span className="px-3 py-1 bg-muted rounded-full">{lesson.category}</span>
+            {lesson.cefrLevel && <span className="px-3 py-1 bg-muted rounded-full">{lesson.cefrLevel}</span>}
+            {lesson.skillFocus && <span className="px-3 py-1 bg-muted rounded-full">{lesson.skillFocus}</span>}
           </div>
         </div>
 
         {/* Content */}
         <div className="grid lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2">
-            {/* Lesson Content */}
-            <div className="card-elegant p-8 mb-8 animate-slideUp">
-              <h2 className="text-2xl font-semibold mb-6">Lesson Content</h2>
-              <div className="prose prose-sm max-w-none">
-                <Streamdown>{lesson.content}</Streamdown>
+            {dynamicLesson ? (
+              <LessonRenderer
+                lesson={dynamicLesson}
+                onBlockComplete={(block, result) => handleBlockComplete(block, result)}
+              />
+            ) : (
+              <div className="card-elegant p-8 mb-8 animate-slideUp">
+                <h2 className="text-2xl font-semibold mb-6">Lesson Content</h2>
+                <div className="prose prose-sm max-w-none">
+                  <Streamdown>{lesson.content}</Streamdown>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Examples */}
             {examples.length > 0 && (
@@ -256,4 +297,16 @@ export default function LessonDetailPage() {
       </div>
     </div>
   );
+}
+
+function normalizeDynamicLesson(lesson: any): DynamicLesson | null {
+  if (!lesson?.lessonJson) return null;
+  if (typeof lesson.lessonJson === "string") {
+    try {
+      return JSON.parse(lesson.lessonJson);
+    } catch {
+      return null;
+    }
+  }
+  return lesson.lessonJson as DynamicLesson;
 }

@@ -13,12 +13,18 @@ import {
   learningStreaks,
   ieltsResults,
   InsertIeltsResult,
+  lessonAttempts,
+  recommendations,
+  speakingAttempts,
 } from "../drizzle/schema";
+import type { DynamicLessonSchema } from "./modules/lessons/lesson.schema";
+import { mapCefrToDifficulty } from "./modules/lessons/lesson.service";
 import { ENV } from "./_core/env";
 
 // ── DB connection (lazy, singleton) ─────────────────────────────────────────
 let _pool: Pool | null = null;
 let _db: ReturnType<typeof drizzle> | null = null;
+let _dynamicLessonSchemaReady = false;
 
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
@@ -31,6 +37,109 @@ export async function getDb() {
     }
   }
   return _db;
+}
+
+async function ensureDynamicLessonSchema() {
+  if (_dynamicLessonSchemaReady || !_pool) return;
+
+  await _pool.query(`
+    DO $$ BEGIN
+      CREATE TYPE "cefr_level" AS ENUM ('A1', 'A2', 'B1', 'B2', 'C1', 'C2');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+
+    DO $$ BEGIN
+      CREATE TYPE "lesson_skill" AS ENUM ('vocabulary', 'grammar', 'dialogue', 'listening', 'speaking', 'mixed');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+
+    DO $$ BEGIN
+      CREATE TYPE "lesson_status" AS ENUM ('draft', 'published', 'archived', 'failed_validation');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+
+    DO $$ BEGIN
+      CREATE TYPE "lesson_progress_status" AS ENUM ('not_started', 'in_progress', 'completed');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+
+    ALTER TABLE "lessons"
+      ADD COLUMN IF NOT EXISTS "cefrLevel" "cefr_level",
+      ADD COLUMN IF NOT EXISTS "skillFocus" "lesson_skill",
+      ADD COLUMN IF NOT EXISTS "topic" varchar(100),
+      ADD COLUMN IF NOT EXISTS "estimatedDurationMinutes" integer,
+      ADD COLUMN IF NOT EXISTS "lessonJson" jsonb,
+      ADD COLUMN IF NOT EXISTS "generationPrompt" text,
+      ADD COLUMN IF NOT EXISTS "generatedBy" varchar(100),
+      ADD COLUMN IF NOT EXISTS "version" integer NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS "status" "lesson_status" NOT NULL DEFAULT 'draft';
+
+    CREATE INDEX IF NOT EXISTS "lesson_cefr_idx" ON "lessons" ("cefrLevel");
+    CREATE INDEX IF NOT EXISTS "lesson_skill_idx" ON "lessons" ("skillFocus");
+    CREATE INDEX IF NOT EXISTS "lesson_status_idx" ON "lessons" ("status");
+
+    ALTER TABLE "user_progress"
+      ADD COLUMN IF NOT EXISTS "status" "lesson_progress_status" NOT NULL DEFAULT 'not_started',
+      ADD COLUMN IF NOT EXISTS "completionPercentage" numeric(5,2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS "score" numeric(5,2) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS "vocabularyScore" numeric(5,2),
+      ADD COLUMN IF NOT EXISTS "grammarScore" numeric(5,2),
+      ADD COLUMN IF NOT EXISTS "listeningScore" numeric(5,2),
+      ADD COLUMN IF NOT EXISTS "speakingScore" numeric(5,2),
+      ADD COLUMN IF NOT EXISTS "quizScore" numeric(5,2),
+      ADD COLUMN IF NOT EXISTS "startedAt" timestamp,
+      ADD COLUMN IF NOT EXISTS "updatedAt" timestamp NOT NULL DEFAULT now();
+
+    CREATE TABLE IF NOT EXISTS "lesson_attempts" (
+      "id" serial PRIMARY KEY,
+      "userId" integer NOT NULL,
+      "lessonId" integer NOT NULL,
+      "blockId" varchar(100) NOT NULL,
+      "blockType" varchar(50) NOT NULL,
+      "userAnswer" jsonb,
+      "aiFeedback" jsonb,
+      "score" numeric(5,2),
+      "createdAt" timestamp NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS "lesson_attempt_user_lesson_block_idx"
+      ON "lesson_attempts" ("userId", "lessonId", "blockId");
+
+    CREATE TABLE IF NOT EXISTS "speaking_attempts" (
+      "id" serial PRIMARY KEY,
+      "userId" integer NOT NULL,
+      "lessonId" integer NOT NULL,
+      "speakingTaskId" varchar(100) NOT NULL,
+      "audioUrl" text,
+      "transcript" text,
+      "targetText" text NOT NULL,
+      "pronunciationScore" numeric(5,2),
+      "fluencyScore" numeric(5,2),
+      "accuracyScore" numeric(5,2),
+      "whisperResult" jsonb,
+      "speechbrainResult" jsonb,
+      "llamaFeedback" jsonb,
+      "createdAt" timestamp NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS "speaking_attempt_user_lesson_idx"
+      ON "speaking_attempts" ("userId", "lessonId");
+
+    CREATE TABLE IF NOT EXISTS "recommendations" (
+      "id" serial PRIMARY KEY,
+      "userId" integer NOT NULL,
+      "lessonId" integer NOT NULL,
+      "reason" text NOT NULL,
+      "priority" integer NOT NULL DEFAULT 1,
+      "recommendationType" varchar(50) NOT NULL,
+      "createdAt" timestamp NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS "recommendation_user_idx" ON "recommendations" ("userId");
+    CREATE INDEX IF NOT EXISTS "recommendation_priority_idx" ON "recommendations" ("userId", "priority");
+  `);
+
+  _dynamicLessonSchemaReady = true;
 }
 
 // ── Users ────────────────────────────────────────────────────────────────────
@@ -94,25 +203,79 @@ export async function getUserByOpenId(openId: string) {
 export async function getAllLessons() {
   const db = await getDb();
   if (!db) return [];
+  await ensureDynamicLessonSchema();
   return db.select().from(lessons).orderBy(lessons.order);
 }
 
 export async function getLessonsByCategory(category: string) {
   const db = await getDb();
   if (!db) return [];
+  await ensureDynamicLessonSchema();
   return db.select().from(lessons).where(eq(lessons.category, category)).orderBy(lessons.order);
 }
 
 export async function getLessonsByDifficulty(difficulty: "Beginner" | "Intermediate" | "Advanced") {
   const db = await getDb();
   if (!db) return [];
+  await ensureDynamicLessonSchema();
   return db.select().from(lessons).where(eq(lessons.difficulty, difficulty)).orderBy(lessons.order);
 }
 
 export async function getLessonById(id: number) {
   const db = await getDb();
   if (!db) return null;
+  await ensureDynamicLessonSchema();
   const result = await db.select().from(lessons).where(eq(lessons.id, id)).limit(1);
+  return result[0] ?? null;
+}
+
+export async function createDynamicLesson(data: {
+  lesson: DynamicLessonSchema;
+  generationPrompt: string;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  await ensureDynamicLessonSchema();
+
+  const { lesson } = data;
+  const result = await db
+    .insert(lessons)
+    .values({
+      title: lesson.title,
+      description: lesson.description,
+      category: lesson.topic,
+      difficulty: mapCefrToDifficulty(lesson.cefrLevel),
+      content: lesson.description,
+      examples: JSON.stringify(
+        lesson.blocks
+          .filter(block => block.type === "vocabulary")
+          .flatMap(block => "items" in block && Array.isArray(block.items) ? block.items : [])
+          .map((item: any) => ({ text: item.word, translation: item.definition }))
+      ),
+      cefrLevel: lesson.cefrLevel,
+      skillFocus: lesson.skillFocus,
+      topic: lesson.topic,
+      estimatedDurationMinutes: lesson.estimatedDurationMinutes,
+      lessonJson: lesson,
+      generationPrompt: data.generationPrompt,
+      generatedBy: lesson.metadata.generatedBy || "llama-3",
+      version: lesson.metadata.version,
+      status: "draft",
+    })
+    .returning();
+
+  return result[0] ?? null;
+}
+
+export async function publishLesson(id: number) {
+  const db = await getDb();
+  if (!db) return null;
+  await ensureDynamicLessonSchema();
+  const result = await db
+    .update(lessons)
+    .set({ status: "published", updatedAt: new Date() })
+    .where(eq(lessons.id, id))
+    .returning();
   return result[0] ?? null;
 }
 
@@ -220,6 +383,204 @@ export async function getUserProgress(userId: number, lessonId: number) {
     .where(and(eq(userProgress.userId, userId), eq(userProgress.lessonId, lessonId)))
     .limit(1);
   return result[0] ?? null;
+}
+
+export async function updateLessonProgress(
+  userId: number,
+  lessonId: number,
+  data: {
+    status?: "not_started" | "in_progress" | "completed";
+    completionPercentage?: number;
+    score?: number;
+    vocabularyScore?: number;
+    grammarScore?: number;
+    listeningScore?: number;
+    speakingScore?: number;
+    quizScore?: number;
+  }
+) {
+  const db = await getDb();
+  if (!db) return null;
+  await ensureDynamicLessonSchema();
+
+  const status = data.status ?? "in_progress";
+  const completed = status === "completed" || (data.completionPercentage ?? 0) >= 100;
+  const now = new Date();
+
+  const values = {
+    userId,
+    lessonId,
+    completed,
+    status: completed ? "completed" as const : status,
+    completionPercentage: String(data.completionPercentage ?? (completed ? 100 : 0)),
+    score: String(data.score ?? 0),
+    vocabularyScore: data.vocabularyScore == null ? null : String(data.vocabularyScore),
+    grammarScore: data.grammarScore == null ? null : String(data.grammarScore),
+    listeningScore: data.listeningScore == null ? null : String(data.listeningScore),
+    speakingScore: data.speakingScore == null ? null : String(data.speakingScore),
+    quizScore: data.quizScore == null ? null : String(data.quizScore),
+    startedAt: now,
+    completedAt: completed ? now : null,
+    updatedAt: now,
+  };
+
+  const existing = await db
+    .select()
+    .from(userProgress)
+    .where(and(eq(userProgress.userId, userId), eq(userProgress.lessonId, lessonId)))
+    .limit(1);
+
+  if (existing[0]) {
+    const result = await db
+      .update(userProgress)
+      .set({
+        completed: values.completed,
+        status: values.status,
+        completionPercentage: values.completionPercentage,
+        score: values.score,
+        vocabularyScore: values.vocabularyScore,
+        grammarScore: values.grammarScore,
+        listeningScore: values.listeningScore,
+        speakingScore: values.speakingScore,
+        quizScore: values.quizScore,
+        completedAt: values.completedAt,
+        updatedAt: now,
+      })
+      .where(eq(userProgress.id, existing[0].id))
+      .returning();
+
+    return result[0] ?? null;
+  }
+
+  const result = await db
+    .insert(userProgress)
+    .values(values)
+    .returning();
+
+  return result[0] ?? null;
+}
+
+export async function recordLessonAttempt(data: {
+  userId: number;
+  lessonId: number;
+  blockId: string;
+  blockType: string;
+  userAnswer?: unknown;
+  aiFeedback?: unknown;
+  score?: number;
+}) {
+  const db = await getDb();
+  if (!db) return null;
+  await ensureDynamicLessonSchema();
+
+  const result = await db
+    .insert(lessonAttempts)
+    .values({
+      userId: data.userId,
+      lessonId: data.lessonId,
+      blockId: data.blockId,
+      blockType: data.blockType,
+      userAnswer: data.userAnswer ?? null,
+      aiFeedback: data.aiFeedback ?? null,
+      score: data.score == null ? null : String(data.score),
+    })
+    .returning();
+
+  return result[0] ?? null;
+}
+
+export async function recordSpeakingAttempt(data: {
+  userId: number;
+  lessonId: number;
+  speakingTaskId: string;
+  audioUrl?: string;
+  transcript: string;
+  targetText: string;
+  pronunciationScore: number;
+  fluencyScore: number;
+  accuracyScore: number;
+  whisperResult?: unknown;
+  speechbrainResult?: unknown;
+  llamaFeedback?: unknown;
+}) {
+  const db = await getDb();
+  if (!db) return null;
+  await ensureDynamicLessonSchema();
+
+  const result = await db
+    .insert(speakingAttempts)
+    .values({
+      userId: data.userId,
+      lessonId: data.lessonId,
+      speakingTaskId: data.speakingTaskId,
+      audioUrl: data.audioUrl ?? null,
+      transcript: data.transcript,
+      targetText: data.targetText,
+      pronunciationScore: String(data.pronunciationScore),
+      fluencyScore: String(data.fluencyScore),
+      accuracyScore: String(data.accuracyScore),
+      whisperResult: data.whisperResult ?? null,
+      speechbrainResult: data.speechbrainResult ?? null,
+      llamaFeedback: data.llamaFeedback ?? null,
+    })
+    .returning();
+
+  return result[0] ?? null;
+}
+
+export async function getLessonRecommendations(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  await ensureDynamicLessonSchema();
+
+  const progressRows = await db.select().from(userProgress).where(eq(userProgress.userId, userId));
+  const completedLessonIds = new Set(progressRows.filter(row => row.completed).map(row => row.lessonId));
+  const weakSkills = new Set<string>(detectWeakSkills(progressRows));
+  const candidateLessons = await db.select().from(lessons).orderBy(lessons.order);
+
+  return candidateLessons
+    .filter(lesson => !completedLessonIds.has(lesson.id))
+    .map(lesson => {
+      const skill = lesson.skillFocus ?? "mixed";
+      const isWeakSkill = weakSkills.has(skill);
+      return {
+        lessonId: lesson.id,
+        title: lesson.title,
+        cefrLevel: lesson.cefrLevel,
+        skillFocus: lesson.skillFocus,
+        topic: lesson.topic ?? lesson.category,
+        priority: isWeakSkill ? 10 : lesson.skillFocus === "mixed" ? 7 : 5,
+        recommendationType: isWeakSkill ? "weakness_practice" : "next_lesson",
+        reason: isWeakSkill
+          ? `Recommended because your recent ${skill} scores need more practice.`
+          : "Recommended as a suitable next lesson for your learning path.",
+      };
+    })
+    .sort((a, b) => b.priority - a.priority)
+    .slice(0, 6);
+}
+
+function detectWeakSkills(progressRows: Array<typeof userProgress.$inferSelect>) {
+  const scoreFields = [
+    ["vocabulary", "vocabularyScore"],
+    ["grammar", "grammarScore"],
+    ["listening", "listeningScore"],
+    ["speaking", "speakingScore"],
+    ["quiz", "quizScore"],
+  ] as const;
+
+  return scoreFields
+    .filter(([, field]) => {
+      const scores = progressRows
+        .map(row => row[field])
+        .filter((score): score is string => score != null)
+        .map(Number);
+
+      if (scores.length === 0) return false;
+      const average = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+      return average < 70;
+    })
+    .map(([skill]) => skill);
 }
 
 // ── Achievements ──────────────────────────────────────────────────────────────

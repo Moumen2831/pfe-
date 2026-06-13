@@ -60,6 +60,31 @@ interface SpeechBrainEvalResult {
   what_they_said?: string;   // optional alias
   feedback: string;
   suggestions: string[];
+  pronunciation_score?: number;
+  cefr_level?: string;
+  grade?: { color?: string; label?: string; letter?: string };
+  fluency?: {
+    avg_pause_sec?: number;
+    fluency_score?: number;
+    long_pauses?: number;
+    pace_label?: string;
+    rhythm_score?: number;
+    silence_sec?: number;
+    speaking_rate?: number;
+    speech_ratio?: number;
+    total_pauses?: number;
+    total_speech_sec?: number;
+  };
+  strengths?: string[];
+  weaknesses?: string[];
+  whisper_confidence?: number;
+  word_level_results?: Array<{
+    word: string;
+    word_score?: number;
+    coaching?: string | null;
+    errors?: string[];
+    phonetic_hint?: string | null;
+  }>;
 }
 
 interface CollectedSpeakingEntry {
@@ -141,12 +166,77 @@ async function callGroq(prompt: string): Promise<string> {
       console.warn(`[IELTS] OpenRouter ${res.status}, retrying (attempt ${attempt + 1})...`);
       continue;
     }
-    const data = await res.json();
+    const bodyText = await res.text();
+    if (!res.ok) {
+      throw new Error(`OpenRouter ${res.status}: ${bodyText.slice(0, 200) || res.statusText}`);
+    }
+    if (!bodyText.trim()) {
+      console.warn(`[IELTS] OpenRouter returned an empty response (attempt ${attempt + 1})`);
+      continue;
+    }
+
+    let data: { choices?: { message?: { content?: string } }[]; error?: { message?: string } };
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`OpenRouter returned non-JSON response: ${bodyText.slice(0, 200)}`);
+    }
+    if (data.error?.message) throw new Error(`OpenRouter error: ${data.error.message}`);
+
     const content = data.choices?.[0]?.message?.content ?? "";
+    if (!content.trim()) {
+      console.warn(`[IELTS] OpenRouter returned empty message content (attempt ${attempt + 1})`);
+      continue;
+    }
     const objMatch = content.match(/\{[\s\S]*\}/);
     return objMatch ? objMatch[0] : content.replace(/```json|```/g, "").trim();
   }
-  throw new Error("OpenRouter rate limit: all retries exhausted");
+  throw new Error("OpenRouter did not return usable content after retries");
+}
+
+function parseGroqJson<T>(raw: string, label: string): T {
+  const cleaned = raw.match(/\{[\s\S]*\}/)?.[0] ?? raw.replace(/```json|```/g, "").trim();
+  if (!cleaned) throw new Error(`${label}: empty JSON response`);
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch (err) {
+    console.warn(`[IELTS] ${label} JSON parse failed. Raw response:`, raw);
+    throw err;
+  }
+}
+
+function clampScore(value: unknown, min: number, max: number): number {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return min;
+  return Math.min(max, Math.max(min, Math.round(num)));
+}
+
+function fallbackWritingSectionEval(aggregated: WritingAggregatedResult): SectionEval {
+  const bandScore = Math.max(1, Math.min(9, Math.round((aggregated.averageScore / 10) * 9 * 2) / 2));
+  return {
+    bandScore,
+    taskAchievement: "Writing tasks were scored individually. A holistic task-achievement summary was not available from the AI service.",
+    vocabularyRange: "Vocabulary could not be summarized holistically because the final AI summary call failed.",
+    grammaticalAccuracy: "Grammar could not be summarized holistically because the final AI summary call failed.",
+    coherenceOrFluency: "Coherence could not be summarized holistically because the final AI summary call failed.",
+    overallFeedback: "Per-question writing scores are available below. Review the individual feedback for the most useful next steps.",
+  };
+}
+
+function fallbackSpeakingSectionEval(aggregated: SpeakingAggregatedResult): SectionEval {
+  return {
+    bandScore: aggregated.bandScore,
+    taskAchievement: "Speaking tasks were scored question by question. A holistic speaking summary was not available from the AI service.",
+    vocabularyRange: "Vocabulary could not be summarized holistically because the final AI summary call failed.",
+    grammaticalAccuracy: "Grammar could not be summarized holistically because the final AI summary call failed.",
+    coherenceOrFluency: "Fluency is reflected in the per-question speaking scores below.",
+    overallFeedback: "Per-question speaking scores are available below. Review the content and pronunciation feedback for the most useful next steps.",
+  };
+}
+
+function isOpenRouterAuthError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("OpenRouter 401") || message.toLowerCase().includes("user not found");
 }
 
 
@@ -196,12 +286,10 @@ async function evaluateOneWritingQuestion(e: CollectedWritingEntry, taskNum: num
   ].join("\n");
 
   const raw = await callGroq(prompt);
-  const objMatch = raw.match(/\{[\s\S]*\}/);
-  const cleaned = objMatch ? objMatch[0] : raw;
-  const parsed = JSON.parse(cleaned) as { score: number; feedback: string };
+  const parsed = parseGroqJson<{ score: number; feedback: string }>(raw, `Writing Q${taskNum}`);
   return {
     questionIndex: e.questionIndex,
-    score: Math.min(10, Math.max(0, Math.round(parsed.score ?? 0))),
+    score: clampScore(parsed.score, 0, 10),
     feedback: parsed.feedback ?? "",
   };
 }
@@ -221,6 +309,16 @@ async function evaluateWritingBatch(entries: CollectedWritingEntry[]): Promise<{
       perQuestion.push(result);
     } catch (err) {
       console.error("[IELTS] Writing eval failed for Q" + (i + 1) + ":", err);
+      if (isOpenRouterAuthError(err)) {
+        for (let j = i; j < entries.length; j++) {
+          perQuestion.push({
+            questionIndex: entries[j].questionIndex,
+            score: 0,
+            feedback: "OpenRouter key was rejected, so LLaMA writing feedback could not be generated.",
+          });
+        }
+        break;
+      }
       perQuestion.push({ questionIndex: entries[i].questionIndex, score: 0, feedback: "Evaluation failed for this question." });
     }
   }
@@ -265,8 +363,14 @@ Return ONLY a valid JSON object with no markdown, no extra text:
   "overallFeedback": "<4-5 sentences: overall strengths, weaknesses, and specific improvement advice for Writing>"
 }`;
 
-  const json = await callGroq(prompt);
-  const sectionEval = JSON.parse(json) as SectionEval;
+  let sectionEval: SectionEval;
+  try {
+    const json = await callGroq(prompt);
+    sectionEval = parseGroqJson<SectionEval>(json, "Writing holistic summary");
+  } catch (err) {
+    console.warn("[IELTS] Writing holistic eval failed, using per-question fallback:", err);
+    sectionEval = fallbackWritingSectionEval(aggregated);
+  }
   return { aggregated, sectionEval };
 }
 
@@ -293,15 +397,12 @@ async function evaluateOneSpeakingContent(e: CollectedSpeakingEntry): Promise<Sp
     'Reply ONLY with a JSON object, no markdown, no explanation: { "contentScore": <0-4>, "feedback": "<1-2 sentences>" }',
   ].join("\n");
 
-  // around line 207-214
-   const raw = await callGroq(prompt);
-   console.log("[IELTS] Raw LLaMA response for Q" + e.questionIndex + ":", raw); // ← add this
-    const objMatch = raw.match(/\{[\s\S]*\}/);
-    const cleaned = objMatch ? objMatch[0] : raw;
-    const parsed = JSON.parse(cleaned) as { contentScore: number; feedback: string };
-    return {
+  const raw = await callGroq(prompt);
+  console.log("[IELTS] Raw LLaMA response for Q" + e.questionIndex + ":", raw);
+  const parsed = parseGroqJson<{ contentScore: number; feedback: string }>(raw, `Speaking Q${e.questionIndex}`);
+  return {
     questionIndex: e.questionIndex,
-    contentScore: Math.min(4, Math.max(0, Math.round(parsed.contentScore ?? 0))),
+    contentScore: clampScore(parsed.contentScore, 0, 4),
     feedback: parsed.feedback ?? "",
   };
 }
@@ -324,6 +425,17 @@ async function evaluateSpeakingContentBatch(entries: CollectedSpeakingEntry[]): 
       results.push(result);
     } catch (err) {
       console.error("[IELTS] Content eval failed for Q" + e.questionIndex + ":", err);
+      if (isOpenRouterAuthError(err)) {
+        const remaining = attempted.slice(attempted.indexOf(e));
+        remaining.forEach(item => {
+          results.push({
+            questionIndex: item.questionIndex,
+            contentScore: 0,
+            feedback: "OpenRouter key was rejected, so LLaMA content feedback could not be generated.",
+          });
+        });
+        break;
+      }
       results.push({ questionIndex: e.questionIndex, contentScore: 0, feedback: "Evaluation failed for this question." });
     }
   }
@@ -336,7 +448,8 @@ async function evaluateSpeakingContentBatch(entries: CollectedSpeakingEntry[]): 
  */
 function sbScoreToSpeakingScore(sbResult: SpeechBrainEvalResult | null | undefined): number {
   if (!sbResult) return 0;
-  const s = sbResult.score; // 0–100
+  const s = Number(sbResult.score ?? sbResult.pronunciation_score ?? sbResult.fluency?.fluency_score ?? 0);
+  if (!Number.isFinite(s)) return 0;
   if (s >= 90) return 6;
   if (s >= 78) return 5;
   if (s >= 65) return 4;
@@ -366,7 +479,7 @@ async function evaluateSpeakingFull(entries: CollectedSpeakingEntry[]): Promise<
   // Step 2: Build a map from questionIndex → contentEval
   const contentMap = new Map<number, SpeakingContentEval>();
   contentEvals.forEach(ce => contentMap.set(ce.questionIndex, ce));
-  console.log("[IELTS] contentEvals count:", contentEvals.length, "keys:", [...contentMap.keys()]);
+  console.log("[IELTS] contentEvals count:", contentEvals.length, "keys:", Array.from(contentMap.keys()));
   console.log("[IELTS] entry questionIndexes:", entries.map(e => e.questionIndex));
 
   // Step 3: Compute per-question scores and enrich entries
@@ -415,8 +528,13 @@ async function evaluateSpeakingFull(entries: CollectedSpeakingEntry[]): Promise<
     })),
   };
 
-  // Step 5: Also run holistic LLaMA SectionEval for the detailed modal
-  const sectionEval = await evaluateSpeakingBatch(enrichedEntries);
+  let sectionEval: SectionEval;
+  try {
+    sectionEval = await evaluateSpeakingBatch(enrichedEntries);
+  } catch (err) {
+    console.warn("[IELTS] Speaking holistic eval failed, using per-question fallback:", err);
+    sectionEval = fallbackSpeakingSectionEval(aggregated);
+  }
 
   return { aggregated, sectionEval, enrichedEntries };
 }
@@ -480,7 +598,7 @@ Return ONLY a valid JSON object with no markdown, no extra text:
 }`;
 
   const json = await callGroq(prompt);
-  return JSON.parse(json) as SectionEval;
+  return parseGroqJson<SectionEval>(json, "Speaking holistic summary");
 }
 
 // ─── SpeechBrain /evaluate-auto integration ──────────────────────────────────
@@ -555,6 +673,57 @@ async function blobToWav(blob: Blob): Promise<Blob> {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+function scoreToFluencyLevel(score: number): string {
+  if (score >= 85) return "excellent";
+  if (score >= 70) return "good";
+  if (score >= 50) return "fair";
+  return "poor";
+}
+
+function normalizeSpeechBrainResult(data: any): SpeechBrainEvalResult {
+  const safeNum = (value: unknown, fallback = 0) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+  };
+  const clampPct = (value: number) => Math.max(0, Math.min(100, value));
+  const pronunciationScore = safeNum(data.pronunciation_score ?? data.score);
+  const fluencyScore = safeNum(data.fluency?.fluency_score ?? data.fluency_score, pronunciationScore);
+  const rhythmScore = safeNum(data.fluency?.rhythm_score ?? data.pace_score, fluencyScore);
+  const overallScore = Number.isFinite(Number(data.score))
+    ? Number(data.score)
+    : Math.round((pronunciationScore * 0.6) + (fluencyScore * 0.4));
+  const strengths = Array.isArray(data.strengths) ? data.strengths : [];
+  const weaknesses = Array.isArray(data.weaknesses) ? data.weaknesses : [];
+  const suggestions = Array.isArray(data.suggestions)
+    ? data.suggestions
+    : weaknesses.length > 0
+      ? weaknesses
+      : strengths;
+  const gradeText = data.grade?.label ? `Grade: ${data.grade.label}${data.grade.letter ? ` (${data.grade.letter})` : ""}.` : "";
+  const weaknessText = weaknesses.length > 0 ? `Focus area: ${weaknesses.join("; ")}.` : "";
+  const strengthText = strengths.length > 0 ? `Strength: ${strengths.join("; ")}.` : "";
+
+  return {
+    ...data,
+    success: Boolean(data.success),
+    score: clampPct(overallScore),
+    clarity_score: clampPct(pronunciationScore),
+    pace_score: clampPct(rhythmScore),
+    fluency_level: data.fluency_level ?? scoreToFluencyLevel(fluencyScore),
+    speaking_rate: safeNum(data.fluency?.speaking_rate ?? data.speaking_rate),
+    word_count: safeNum(data.word_count),
+    duration_seconds: safeNum(data.duration_seconds),
+    processing_time: safeNum(data.processing_time),
+    transcription: data.transcription ?? data.what_they_said ?? "",
+    what_they_said: data.what_they_said ?? data.transcription ?? "",
+    feedback: data.feedback ?? [gradeText, weaknessText, strengthText].filter(Boolean).join(" "),
+    suggestions,
+    pronunciation_score: pronunciationScore,
+    strengths,
+    weaknesses,
+  };
+}
+
 async function evaluateAudioWithSpeechBrain(blob: Blob): Promise<SpeechBrainEvalResult> {
   // Always convert to proper WAV — browser MediaRecorder produces webm/ogg
   // which SpeechBrain's ffmpeg backend cannot open reliably.
@@ -570,7 +739,7 @@ async function evaluateAudioWithSpeechBrain(blob: Blob): Promise<SpeechBrainEval
   }
   const data = await res.json();
   if (!data.success) throw new Error(`SpeechBrain error: ${data.error ?? "success=false"}`);
-  return data as SpeechBrainEvalResult;
+  return normalizeSpeechBrainResult(data);
 }
 
 // ─── 80 built-in fallback questions (20 per section) ─────────────────────────
@@ -735,7 +904,7 @@ function FinalEvalModal({
         <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-2xl font-extrabold text-white">{section} — Final Evaluation</h2>
-            <p className="text-sm text-white/40 mt-0.5">All {section === "Writing" ? "writing tasks" : "speaking tasks"} evaluated together by OpenRouter AI</p>
+            <p className="text-sm text-white/40 mt-0.5">Each {section === "Writing" ? "writing task" : "speaking task"} evaluated individually by OpenRouter AI</p>
           </div>
           <button onClick={onClose} className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/50 hover:text-white transition-all"><X size={18} /></button>
         </div>
@@ -791,7 +960,7 @@ function SpeakingRecorderModal({
   const [sttError, setSttError]         = useState("");
   const [isListening, setIsListening]   = useState(false);
 
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<any>(null);
   const mrRef          = useRef<MediaRecorder | null>(null);
   const chunksRef      = useRef<Blob[]>([]);
   const blobRef        = useRef<Blob | null>(null);
@@ -819,9 +988,9 @@ function SpeakingRecorderModal({
 
     if (WEB_SPEECH_AVAILABLE) {
       const Ctor = (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition;
-      const rec: SpeechRecognition = new Ctor();
+      const rec: any = new Ctor();
       rec.lang = "en-US"; rec.continuous = true; rec.interimResults = true;
-      rec.onresult = (event: SpeechRecognitionEvent) => {
+      rec.onresult = (event: any) => {
         let interim = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
           if (event.results[i].isFinal) fullTextRef.current += event.results[i][0].transcript + " ";
@@ -829,7 +998,7 @@ function SpeakingRecorderModal({
         }
         setTranscript((fullTextRef.current + interim).trim());
       };
-      rec.onerror = (e: SpeechRecognitionErrorEvent) => { if (e.error !== "no-speech" && e.error !== "aborted") setSttError(`Speech error: ${e.error}`); };
+      rec.onerror = (e: any) => { if (e.error !== "no-speech" && e.error !== "aborted") setSttError(`Speech error: ${e.error}`); };
       rec.onend   = () => setIsListening(false);
       try { rec.start(); recognitionRef.current = rec; setIsListening(true); }
       catch { setSttError("Web Speech API failed. Try Chrome or Edge."); }
@@ -945,6 +1114,8 @@ function PassagePanel({ section, sourceTitle, sourceContent, sourceImageUrl, aud
   { section: string; sourceTitle?: string; sourceContent?: string; sourceImageUrl?: string; audioUrl?: string; niveau?: string; passageText?: string; }) {
   const [ttsPlaying, setTtsPlaying]   = useState(false);
   const [imgExpanded, setImgExpanded] = useState(false);
+  const [validAudioUrl, setValidAudioUrl] = useState<string | null>(null);
+  const [audioCheckMessage, setAudioCheckMessage] = useState<string | null>(null);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   // Prefer sourceContent, then passageText — try both
   const displayText  = (sourceContent ?? passageText ?? "").trim();
@@ -955,6 +1126,49 @@ function PassagePanel({ section, sourceTitle, sourceContent, sourceImageUrl, aud
   const isReading    = sec === "reading";
   const isWriting    = sec === "writing";
   const isSpeaking   = sec === "speaking";
+
+  useEffect(() => {
+    let cancelled = false;
+    setValidAudioUrl(null);
+    setAudioCheckMessage(null);
+
+    if (!audioUrl) return;
+
+    let parsed: URL;
+    try {
+      parsed = new URL(audioUrl, window.location.origin);
+    } catch {
+      setAudioCheckMessage("Listening audio URL is invalid. Use the text playback fallback.");
+      return;
+    }
+
+    if (parsed.origin !== window.location.origin) {
+      setValidAudioUrl(audioUrl);
+      return;
+    }
+
+    fetch(parsed.toString(), { method: "HEAD" })
+      .then((res) => {
+        if (cancelled) return;
+        const type = res.headers.get("content-type") ?? "";
+        if (res.ok && type.toLowerCase().startsWith("audio/")) {
+          setValidAudioUrl(audioUrl);
+          return;
+        }
+        console.warn("[IELTS] Listening audio unavailable or not audio:", audioUrl, res.status, type);
+        setAudioCheckMessage("Listening audio file was not found. Use the text playback fallback.");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn("[IELTS] Listening audio check failed:", err);
+        setAudioCheckMessage("Listening audio could not be checked. Use the text playback fallback.");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [audioUrl]);
+
   // For reading: always render the panel (even without text, to show a warning)
   // For other sections: skip if nothing to show
   if (!isReading && !displayText && !hasImage && !audioUrl) return null;
@@ -994,8 +1208,11 @@ function PassagePanel({ section, sourceTitle, sourceContent, sourceImageUrl, aud
           </button>
         )}
       </div>
-      {audioUrl && (
-        <div className="mb-4"><audio controls className="w-full rounded-lg" style={{ height: 36 }}><source src={audioUrl} type="audio/mpeg" /></audio></div>
+      {validAudioUrl && (
+        <div className="mb-4"><audio controls className="w-full rounded-lg" style={{ height: 36 }}><source src={validAudioUrl} /></audio></div>
+      )}
+      {audioCheckMessage && (
+        <p className="text-xs text-amber-400/70 italic mb-3">{audioCheckMessage}</p>
       )}
       {hasImage && (
         <div className="mb-4">
@@ -1217,15 +1434,17 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
 
     // 2. Writing batch evaluation
     let wEval: SectionEval | null = null;
+    let wPerQuestion: WritingQuestionScore[] = [];
     console.log("[IELTS] GROQ_AVAILABLE:", GROQ_AVAILABLE, "speaking entries:", collectedSpeaking.current.length, "key:", OPENROUTER_API_KEY?.slice(0,12));
     const realWriting = collectedWriting.current.filter(e => e.answer && e.answer !== "(skipped)");
     if (GROQ_AVAILABLE && realWriting.length > 0) {
       try {
-        setEvalStep("Evaluating all writing tasks…");
+        setEvalStep("Evaluating writing tasks one by one...");
         const { aggregated: wAgg, sectionEval: wSectionEval } = await evaluateWritingBatch(realWriting);
         setWritingAggregated(wAgg);
         setWritingEval(wSectionEval);
         wEval = wSectionEval;
+        wPerQuestion = wAgg.perQuestion;
       } catch (err) {
         console.warn("[IELTS] Writing batch eval failed:", err);
         setEvalError("Writing AI evaluation failed — showing objective scores only.");
@@ -1239,14 +1458,16 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
     }
 
     let sEval: SectionEval | null = null;
+    let sPerQuestion: SpeakingAggregatedResult["perQuestion"] = [];
     if (GROQ_AVAILABLE && collectedSpeaking.current.length > 0) {
       try {
-        setEvalStep("Sending all speaking answers to LLaMA for content + speaking evaluation…");
+        setEvalStep("Evaluating speaking answers one by one...");
         const { aggregated, sectionEval, enrichedEntries } = await evaluateSpeakingFull(collectedSpeaking.current);
         setSpeakingAggregated(aggregated);
         setSpeakingEval(sectionEval);
         enrichedSpeakingRef.current = enrichedEntries;
         sEval = sectionEval;
+        sPerQuestion = aggregated.perQuestion;
       } catch (err) {
         console.warn("[IELTS] Speaking full eval failed:", err);
         setEvalError("Speaking AI evaluation failed — showing objective scores only.");
@@ -1298,7 +1519,7 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
             source:          "llama",
             overallBand:     wEval.bandScore,
             overallFeedback: wEval.overallFeedback,
-            perQuestion:     wEval.perQuestion,
+            perQuestion:     wPerQuestion,
           }).catch(e => console.error("[IELTS] Save writing feedback failed:", e));
         }
 
@@ -1309,7 +1530,7 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
             source:          "combined",
             overallBand:     sEval.bandScore,
             overallFeedback: sEval.overallFeedback,
-            perQuestion:     sEval.perQuestion,
+            perQuestion:     sPerQuestion,
           }).catch(e => console.error("[IELTS] Save speaking feedback failed:", e));
         }
       } catch (e) { console.warn("[IELTS] Save failed:", e); }
@@ -1372,7 +1593,7 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
         <Loader2 className="w-14 h-14 animate-spin text-orange-400 mx-auto mb-6" />
         <h2 className="text-2xl font-bold text-white mb-2">Calculating your results…</h2>
         <p className="text-orange-400 text-sm font-semibold mb-1">{evalStep}</p>
-        <p className="text-white/30 text-xs">OpenRouter AI is reading all your answers together to give one holistic score per section — just like a real IELTS examiner.</p>
+        <p className="text-white/30 text-xs">OpenRouter AI is scoring writing and speaking one question at a time, then summarizing the section.</p>
       </div>
     </div>
   );
@@ -2047,8 +2268,8 @@ const saveFeedback = trpc.ielts.saveFeedback.useMutation();
             <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold mb-4 border ${
               isWriting ? "bg-purple-500/20 text-purple-400 border-purple-500/30" : "bg-orange-500/20 text-orange-400 border-orange-500/30"
             }`}>
-              {isWriting ? "📝 Answer saved — all writing evaluated together at the end"
-                        : <><Mic size={11} /> Answer recorded — all speaking evaluated together at the end</>}
+              {isWriting ? "📝 Answer saved — writing is evaluated one question at a time"
+                        : <><Mic size={11} /> Answer recorded — speaking is evaluated one question at a time</>}
             </div>
           )}
 
